@@ -8,9 +8,8 @@
 #include <utility>
 
 #define INITIAL_ALLOCATION 1500
-static void packetFreeCallback(ENetPacket* pkt) {
-	delete[] pkt->data;
-}
+
+
 
 class Packet {
 	// num_keys, keys_offset, data..., keys
@@ -27,60 +26,61 @@ class Packet {
 		char* m_data;
 		bool m_sent;
 		bool m_readonly;
+		bool m_packet_owns_data_ptr;
+		bool m_parsed_pkt;
 		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
-		ENetPacket* last_packet;
+		size_type m_num_keys;
+		
 		// key, (offset, length)
 		std::map<key_type, std::pair<size_type, size_type>> m_offsets;
 		
-		void parsePacket() {
-			if(!m_offsets.empty())
+		bool parsePacket() {
+			if(!m_offsets.empty()) {
 				m_offsets.clear();
-			
-			if(m_size < 4) return;
-			
-			// read keys
-			size_type num_keys;
-			size_type* s = (size_type*)m_data;
-			num_keys = s[0];
-			m_keys_offset = s[1];
-			
-			if(num_keys < 0 || m_keys_offset < 0 || m_keys_offset >= m_size || m_keys_offset + num_keys*bytes_per_key > m_size) {
-				return;
 			}
+			
+			// must have at least 1 key
+			if(m_size < 8+bytes_per_key || !is_ready_for_parsing()) return false;
 			
 			size_type *keys = (size_type*)(m_data+m_keys_offset);
-			for(int i=0; i < num_keys; i++) {
-				if(keys[i*3+1] > m_size) {
-					m_offsets.clear();
-					return;
+			for(int i=0; i < m_num_keys; i++) {
+				if(keys[i*3+1]+keys[i*3+2] > m_size) {
+					return false;
 				}
-				m_offsets[keys[i*3]] = std::make_pair((size_type)keys[i*3+1], (size_type)keys[i*3+2]);
+				m_offsets[keys[i*3]] = std::make_pair(keys[i*3+1], keys[i*3+2]);
 			}
-			
-			// TODO: check validity of offsets and length
+			m_parsed_pkt = true;
 		}
 		
-		void alloc(int size) {
+		bool alloc(int size) {
 			if(m_size+size > m_allocated_size) {
-				int new_size = m_size+size;
-				
-				m_allocated_size = std::max<size_type>(new_size+100, m_allocated_size*3/2);
-				char* new_alloc = new char[m_allocated_size];
-				memcpy(new_alloc, m_data, m_size);
-				delete[] m_data;
-				m_data = new_alloc;
+				if(m_packet_owns_data_ptr) {
+					int new_size = m_size+size;
+					
+					m_allocated_size = std::max<size_type>(new_size+100, m_allocated_size*3/2);
+					// TODO: ret false on bad alloc
+					char* new_alloc = new char[m_allocated_size];
+					memcpy(new_alloc, m_data, m_size);
+					delete[] m_data;
+					m_data = new_alloc;
+				} else {
+					// needs alloc but cannot alloc
+					return false;
+				}
 			}
+			return true;
 		}
 		
 		inline int keys_size() {
 			return m_offsets.size()*bytes_per_key;
 		}
 		
-		void appendKeysToPacket() {			
+		void appendKeysToPacket() {
+			if(m_readonly) return;
 			m_keys_offset = m_size;
 			
 			// make sure keys can fit
-			alloc(keys_size());
+			if(!alloc(keys_size())) return;
 			
 			size_type* s = (size_type*)m_data;
 			s[0] = m_offsets.size();
@@ -94,17 +94,14 @@ class Packet {
 				write[w*3+2] = (size_type)i.second.second;
 				w++;
 			}
+			
+			// can no longer put data after keys appended
+			m_readonly = true;
 		}
 		
 	public:
 	
-		Packet(ENetPacket* pkt) {
-			m_data = (char*)pkt->data;
-			m_size = pkt->dataLength;
-			m_sent = false;
-			m_readonly = true;
-			parsePacket();
-		}
+		
 		
 		Packet(char* data, int length) {
 			m_data = data;
@@ -145,44 +142,68 @@ class Packet {
 			}
 		}
 		
+		size_type orig_packet_size(char* data=0) {
+			if(!data && m_size < 8+bytes_per_key) return -1;
+			
+			// read keys
+			size_type* s = (size_type*)( data ? data : m_data );
+			m_num_keys = s[0];
+			m_keys_offset = s[1];
+			
+			return m_keys_offset + m_num_keys*bytes_per_key;
+		}
+		
+		
+		bool is_ready_for_parsing() {
+			size_type orig_size = orig_packet_size();
+			return !( m_num_keys < 0 || m_keys_offset < 0 || m_keys_offset >= m_size || orig_size > m_size );
+		}
+		
 		char* data() {
-			if(m_keys_offset == 0)
+			if(m_keys_offset == 0) {
 				appendKeysToPacket();
+			}
+			
 			return m_data; 
 		}
+		
 		size_t size() { return m_size+keys_size(); }
 		
 		size_t allocated_size() { return m_allocated_size; }
 		
 		std::pair<char*,int> get_pair(const std::string& key) {
 			auto it = m_offsets.find(hash(key.c_str()));
-			if(it != m_offsets.end())
+			if(it != m_offsets.end()) {
 				return std::make_pair((char*)&m_data[it->second.first], (int)it->second.second);
-			else
+			} else {
 				return std::make_pair((char*)0,(int)0);
+			}
 		}
 		
 		
 		template<typename T>
 		void get(const std::string& key, T& value) {
 			auto p = get_pair(key);
-			if(p.first && p.second == sizeof(T))
+			if(p.first && p.second == sizeof(T)) {
 				value = *((T*)p.first);
+			}
 		}
 		
 		int get_int(const std::string& key) {
 			auto p = get_pair(key);
-			if(p.first && p.second == sizeof(int))
+			if(p.first && p.second == sizeof(int)) {
 				return *((int*)p.first);
+			}
 			return -1;
 		}
 		
 		std::string get_string(const std::string& key) {
 			auto p = get_pair(key);
-			if(p.first)
+			if(p.first) {
 				return std::string(p.first, p.second);
-			else
+			} else {
 				return std::string("");
+			}
 		}
 		
 		char* allocate(const std::string& key, size_type size) {
@@ -197,13 +218,41 @@ class Packet {
 		
 		void put(const std::string& key, const std::string& value) {
 			char* buffer = allocate(key, value.size());
-			if(buffer)
+			if(buffer) {
 				memcpy(buffer, value.data(), value.size());
+			}
 		}
 		
 		void put(const std::string& key, int value) {
 			char* buffer = allocate(key, sizeof(int));
 			*((int*)(buffer)) = value;
+		}
+		
+		int append(const char* data, int len) {
+			if(m_readonly) return;
+			int orig_len = 0;
+			int need_len = 0;
+			if(m_size < 8) {
+				if(len >= 8) {
+					orig_len = orig_packet_size(data);
+				} else {
+					return 0;
+				}
+			} else {
+				orig_len = orig_packet_size();
+			}
+			need_len = orig_len - m_size;
+			
+			if(!alloc(need_len)) return 0;
+			int transfered = min(need_len, len);
+			
+			memcpy(m_data+m_size, transfered);
+			m_size += transfered;
+			
+			if(transfered == need_len) {
+				parsePacket();
+			}
+			return transfered;
 		}
 		
 		void make_writeable() {
@@ -219,34 +268,85 @@ class Packet {
 			m_readonly = false;
 		}
 		
-		void send(ENetPeer* peer, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
+		bool prepare_to_send() {
 			if(m_readonly) return;
-			if(m_keys_offset == 0)
+			if(m_keys_offset == 0) {
 				appendKeysToPacket();
+			}
+		}
+		
+		void release() {
+			if(m_packet_owns_data_ptr && m_data) {
+				delete m_data;
+			}
+			m_data = 0;
+			m_size = 0;
+		}
+};
+
+
+#ifdef USE_ENET
+static void packetFreeCallback(ENetPacket* pkt) {
+	delete[] pkt->data;
+}
+class PacketEnet : public Packet {
+	private:
+		ENetPacket* last_packet;
+	
+	public:
+		Packet(ENetPacket* pkt) {
+			m_data = (char*)pkt->data;
+			m_size = pkt->dataLength;
+			m_sent = false;
+			m_readonly = true;
+			parsePacket();
+		}
+		
+		bool send(ENetPeer* peer, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
+			if(!prepare_to_send()) return;
+
 			if(!m_sent) {
 				last_packet = enet_packet_create(m_data, size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
 				last_packet->freeCallback = packetFreeCallback;
 				m_sent = true;
 			}
 			enet_peer_send(peer, channel, last_packet);
+			return true;
 		}
 		
-		void broadcast(ENetHost* host, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
-			if(m_readonly) return;
-			if(m_keys_offset == 0)
-				appendKeysToPacket();
+		bool broadcast(ENetHost* host, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
+			if(!prepare_to_send()) return;
+			
 			if(!m_sent) {
 				last_packet = enet_packet_create(m_data, size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
 				last_packet->freeCallback = packetFreeCallback;
 				m_sent = true;
 			}
 			enet_host_broadcast(host, channel, last_packet);
-		}
-		
-		void release() {
-			m_data = 0;
-			m_size = 0;
+			return true;
 		}
 };
+#endif
+
+#ifdef USE_SDL_NET
+class PacketTcp : public Packet {
+	private:
+	
+	public:
+		
+		bool send(TCPsocket* peer) {
+			if(!prepare_to_send()) return;
+
+			int sent = SDLNet_TCP_Send(peer,m_data,size());
+			if(sent < size()) {
+				// printf("SDLNet_TCP_Send: %s\n", SDLNet_GetError());
+				return false;
+			}
+			m_sent = true;
+			return true;
+		}
+};
+#endif
+
 
 #endif

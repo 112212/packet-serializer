@@ -33,5 +33,7 @@ int main() {
 	if(m.first)
 		cout << h.get_string("key1") << endl;
 	cout << h.get_int("type") << ", " << num << endl;
+	
+	
 	return 0;
 }
