@@ -7,7 +7,7 @@
 #include <map>
 #include <utility>
 
-#include <iostream>
+// #include <iostream>
 
 #define INITIAL_ALLOCATION 1500
 
@@ -31,9 +31,10 @@ class Packet {
 		bool m_packet_owns_data_ptr;
 		bool m_parsed_pkt;
 		bool m_appended_keys;
+		size_type m_num_keys;
+		
 		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
 		const int meta_size = sizeof(size_type)*2;
-		size_type m_num_keys;
 		
 		// key, (offset, length)
 		std::map<key_type, std::pair<size_type, size_type>> m_offsets;
@@ -45,7 +46,6 @@ class Packet {
 			
 			// must have at least 1 key
 			if(m_parsed_pkt || m_size < 8+bytes_per_key || !is_ready_for_parsing()) return false;
-			std::cout << "parsing\n";
 			
 			size_type *keys = (size_type*)(m_data+m_keys_offset);
 			for(int i=0; i < m_num_keys; i++) {
@@ -55,8 +55,7 @@ class Packet {
 				}
 				m_offsets[keys[i*3]] = std::make_pair(keys[i*3+1], keys[i*3+2]);
 			}
-			m_parsed_pkt = true;
-			m_appended_keys = true;
+			m_parsed_pkt = m_appended_keys = true;
 			return true;
 		}
 		
@@ -85,6 +84,7 @@ class Packet {
 		
 		void clear_keys() {
 			m_num_keys = 0;
+			m_keys_offset = 0;
 			m_offsets.clear();
 		}
 		
@@ -158,7 +158,6 @@ class Packet {
 		}
 		
 		Packet(int initial_allocation = INITIAL_ALLOCATION) {
-			// m_size = sizeof(size_type)*2;
 			m_size = 0;
 			
 			if(initial_allocation < 0) initial_allocation = INITIAL_ALLOCATION;
@@ -173,6 +172,7 @@ class Packet {
 		}
 		
 		~Packet() {
+			// if packet is sent(ENET will handle with callback), or data is not ours don't deallocate
 			if(!m_sent && !m_readonly && m_data && m_packet_owns_data_ptr) {
 				delete [] m_data;
 			}
@@ -349,20 +349,29 @@ class Packet {
 		
 		bool prepare_to_send() {
 			if(m_readonly) return false;
-			if(m_keys_offset == 0) {
+			if(!m_appended_keys) {
 				appendKeysToPacket();
 			}
 			return true;
 		}
 		
+		void clear() {
+			m_size = 0;
+			m_parsed_pkt = false;
+			m_sent = false;
+			m_appended_keys = false;
+			clear_keys();
+			if(m_packet_owns_data_ptr) {
+				m_readonly = false;
+			}
+		}
+		
 		void release() {
+			clear();
 			if(m_packet_owns_data_ptr && m_data) {
 				delete m_data;
 			}
 			m_data = 0;
-			m_size = 0;
-			m_parsed_pkt = false;
-			m_packet_owns_data_ptr = false;
 		}
 };
 
@@ -424,7 +433,7 @@ class PacketTcp : public Packet {
 				// printf("SDLNet_TCP_Send: %s\n", SDLNet_GetError());
 				return false;
 			}
-			m_sent = true;
+			// m_sent = true;
 			return true;
 		}
 };
