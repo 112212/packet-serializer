@@ -1,2 +1,2 @@
 all:
-	g++ main.cpp -m64 -o main
+	g++ main.cpp -m64 -o main -g

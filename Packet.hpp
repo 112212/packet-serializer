@@ -7,6 +7,8 @@
 #include <map>
 #include <utility>
 
+#include <iostream>
+
 #define INITIAL_ALLOCATION 1500
 
 
@@ -15,7 +17,7 @@ class Packet {
 	// num_keys, keys_offset, data..., keys
 	private:
 		static constexpr unsigned int hash(const char *s, int off = 0) {
-			return s[off] ? (hash(s, off+(s[off+1] == '_' ? 2 : 1))*33) ^ s[off] : 5381;
+			return s[off] ? (hash(s, off+(s[off+1] == '_' ? 2 : 1) )*33) ^ s[off] : 5381;
 		}
 		
 		using key_type = unsigned int;
@@ -28,7 +30,9 @@ class Packet {
 		bool m_readonly;
 		bool m_packet_owns_data_ptr;
 		bool m_parsed_pkt;
+		bool m_appended_keys;
 		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
+		const int meta_size = sizeof(size_type)*2;
 		size_type m_num_keys;
 		
 		// key, (offset, length)
@@ -36,20 +40,24 @@ class Packet {
 		
 		bool parsePacket() {
 			if(!m_offsets.empty()) {
-				m_offsets.clear();
+				clear_keys();
 			}
 			
 			// must have at least 1 key
-			if(m_size < 8+bytes_per_key || !is_ready_for_parsing()) return false;
+			if(m_parsed_pkt || m_size < 8+bytes_per_key || !is_ready_for_parsing()) return false;
+			std::cout << "parsing\n";
 			
 			size_type *keys = (size_type*)(m_data+m_keys_offset);
 			for(int i=0; i < m_num_keys; i++) {
-				if(keys[i*3+1]+keys[i*3+2] > m_size) {
+				if(keys[i*3+1]+keys[i*3+2] >= m_size) {
+					clear_keys();
 					return false;
 				}
 				m_offsets[keys[i*3]] = std::make_pair(keys[i*3+1], keys[i*3+2]);
 			}
 			m_parsed_pkt = true;
+			m_appended_keys = true;
+			return true;
 		}
 		
 		bool alloc(int size) {
@@ -72,19 +80,37 @@ class Packet {
 		}
 		
 		inline int keys_size() {
-			return m_offsets.size()*bytes_per_key;
+			return m_num_keys*bytes_per_key;
+		}
+		
+		void clear_keys() {
+			m_num_keys = 0;
+			m_offsets.clear();
+		}
+		
+		bool writeMetadata() {
+			if(m_size < meta_size) {
+				if(!alloc(meta_size)) return false;
+				m_size = meta_size;
+			}
+			size_type* s = (size_type*)m_data;
+			s[0] = m_num_keys;
+			s[1] = m_keys_offset == 0 ? m_size : m_keys_offset;
+			return true;
 		}
 		
 		void appendKeysToPacket() {
 			if(m_readonly) return;
+			if(m_appended_keys) {
+				// reset keys
+				m_size = m_keys_offset;
+				m_appended_keys = false;
+			}
+			
 			m_keys_offset = m_size;
 			
 			// make sure keys can fit
-			if(!alloc(keys_size())) return;
-			
-			size_type* s = (size_type*)m_data;
-			s[0] = m_offsets.size();
-			s[1] = m_keys_offset;
+			if(!writeMetadata() || !alloc(keys_size())) return;
 			
 			size_type* write = (size_type*)&m_data[m_keys_offset];
 			int w=0;
@@ -95,8 +121,11 @@ class Packet {
 				w++;
 			}
 			
+			m_size += keys_size();
+			
 			// can no longer put data after keys appended
 			m_readonly = true;
+			m_appended_keys = true;
 		}
 		
 	public:
@@ -108,6 +137,8 @@ class Packet {
 			m_size = length;
 			m_sent = false;
 			m_readonly = true;
+			m_parsed_pkt = false;
+			m_packet_owns_data_ptr = false;
 			parsePacket();
 		}
 		
@@ -123,10 +154,12 @@ class Packet {
 				m_size -= keys_size();
 			}
 			memcpy(m_data, p.m_data, m_size);
+			m_packet_owns_data_ptr = true;
 		}
 		
 		Packet(int initial_allocation = INITIAL_ALLOCATION) {
-			m_size = sizeof(size_type)*2;
+			// m_size = sizeof(size_type)*2;
+			m_size = 0;
 			
 			if(initial_allocation < 0) initial_allocation = INITIAL_ALLOCATION;
 			m_allocated_size = initial_allocation;
@@ -134,43 +167,66 @@ class Packet {
 			m_sent = false;
 			m_readonly = false;
 			m_keys_offset = 0;
+			m_packet_owns_data_ptr = true;
+			m_parsed_pkt = false;
+			m_appended_keys = false;
 		}
 		
 		~Packet() {
-			if(!m_sent && !m_readonly && m_data) {
+			if(!m_sent && !m_readonly && m_data && m_packet_owns_data_ptr) {
 				delete [] m_data;
 			}
 		}
 		
-		size_type orig_packet_size(char* data=0) {
-			if(!data && m_size < 8+bytes_per_key) return -1;
-			
+		bool read_metadata() {
+			if(m_size <= 8) return false;
 			// read keys
-			size_type* s = (size_type*)( data ? data : m_data );
+			size_type* s = (size_type*)(m_data);
 			m_num_keys = s[0];
 			m_keys_offset = s[1];
+			return true;
+		}
+		
+		size_type orig_packet_size(const char* data=0) {
+			// if(!data && m_size <= 8) return 0;
 			
-			return m_keys_offset + m_num_keys*bytes_per_key;
+			size_type num_keys = m_num_keys;
+			size_type keys_offset = m_keys_offset == 0 ? m_size : m_keys_offset;
+			
+			if(data) {
+				// read keys from data
+				size_type* s = (size_type*)(data);
+				num_keys = s[0];
+				keys_offset = s[1];
+			}
+			
+			return keys_offset + num_keys*bytes_per_key;
 		}
 		
 		
 		bool is_ready_for_parsing() {
+			read_metadata();
 			size_type orig_size = orig_packet_size();
 			return !( m_num_keys < 0 || m_keys_offset < 0 || m_keys_offset >= m_size || orig_size > m_size );
 		}
 		
+		bool is_readonly() { return m_readonly; }
+		bool is_sent() { return m_sent; }
+		bool is_parsed() { return m_parsed_pkt; }
+		
 		char* data() {
-			if(m_keys_offset == 0) {
+			if(!m_appended_keys) {
 				appendKeysToPacket();
 			}
 			
 			return m_data; 
 		}
 		
-		size_t size() { return m_size+keys_size(); }
+		size_t size() { return m_size+(!m_appended_keys ? keys_size() : 0); }
 		
 		size_t allocated_size() { return m_allocated_size; }
 		
+		// pair of data ptr, and length
 		std::pair<char*,int> get_pair(const std::string& key) {
 			auto it = m_offsets.find(hash(key.c_str()));
 			if(it != m_offsets.end()) {
@@ -208,11 +264,21 @@ class Packet {
 		
 		char* allocate(const std::string& key, size_type size) {
 			if(m_sent || m_readonly) return 0;
-			alloc(size);
+			
+			// if keys appended, then reset
+			if(m_appended_keys) {
+				m_appended_keys = false;
+				m_size = m_keys_offset;
+			} else if(m_size < meta_size) {
+				writeMetadata();
+			}
+			if(!alloc(size)) return 0;
+			
 			m_offsets[hash(key.c_str())] = std::make_pair(m_size, size);
 			int ofs = m_size;
 			m_size += size;
 			m_keys_offset = 0;
+			m_num_keys ++;
 			return &m_data[ofs];
 		}
 		
@@ -225,33 +291,45 @@ class Packet {
 		
 		void put(const std::string& key, int value) {
 			char* buffer = allocate(key, sizeof(int));
-			*((int*)(buffer)) = value;
+			if(buffer) {
+				*((int*)(buffer)) = value;
+			}
 		}
 		
 		int append(const char* data, int len) {
-			if(m_readonly) return;
+			if(m_readonly) return 0;
 			int orig_len = 0;
 			int need_len = 0;
-			if(m_size < 8) {
-				if(len >= 8) {
+			
+			// std::cout << "append cur size: " << m_size << " + " << len << "\n";
+			if(m_size < meta_size) {
+				if(len >= meta_size) {
 					orig_len = orig_packet_size(data);
+					// std::cout << "reading orig len: " << orig_len << "\n";
 				} else {
 					return 0;
 				}
 			} else {
+				read_metadata();
 				orig_len = orig_packet_size();
+				// std::cout << "reading orig len2: " << orig_len << "\n";
 			}
+			m_appended_keys = true;
+			
 			need_len = orig_len - m_size;
+			if(need_len < 0) return 0;
 			
 			if(!alloc(need_len)) return 0;
 			int transfered = min(need_len, len);
 			
-			memcpy(m_data+m_size, transfered);
+			memcpy(m_data+m_size, data, transfered);
 			m_size += transfered;
-			
-			if(transfered == need_len) {
+			// std::cout << "kofs: " << m_keys_offset << "\n";
+			// cout << "m_size1: " << m_size << " : " << size() << " : " << orig_len << " is_parsing_ready: " << is_ready_for_parsing() << " : " << orig_packet_size() << "\n";
+			if(m_size == orig_len) {
 				parsePacket();
 			}
+			// cout << "m_size2: " << m_size << " : " << size() << " : parsed: " << is_parsed() << "\n";
 			return transfered;
 		}
 		
@@ -263,16 +341,18 @@ class Packet {
 			char* new_alloc = new char[m_allocated_size];
 			memcpy(new_alloc, m_data, m_size);
 			m_data = new_alloc;
+			m_packet_owns_data_ptr = true;
 			
 			m_sent = false;
 			m_readonly = false;
 		}
 		
 		bool prepare_to_send() {
-			if(m_readonly) return;
+			if(m_readonly) return false;
 			if(m_keys_offset == 0) {
 				appendKeysToPacket();
 			}
+			return true;
 		}
 		
 		void release() {
@@ -281,6 +361,8 @@ class Packet {
 			}
 			m_data = 0;
 			m_size = 0;
+			m_parsed_pkt = false;
+			m_packet_owns_data_ptr = false;
 		}
 };
 
