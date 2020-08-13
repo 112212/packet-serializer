@@ -1,7 +1,7 @@
 #ifndef PACKET_SERIALIZER_HPP
 #define PACKET_SERIALIZER_HPP
 
-#include <enet/enet.h>
+
 #include <cstring>
 #include <string>
 #include <map>
@@ -16,15 +16,16 @@
 class Packet {
 	// num_keys, keys_offset, data..., keys
 	public:
-		const int meta_size = sizeof(size_type)*2;
-		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
+		using key_type = unsigned int;
+		using size_type = unsigned int;
+		static const int meta_size = sizeof(size_type)*2;
+		static const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
 	private:
 		static constexpr unsigned int hash(const char *s, int off = 0) {
 			return s[off] ? (hash(s, off+(s[off+1] == '_' ? 2 : 1) )*33) ^ s[off] : 5381;
 		}
 		
-		using key_type = unsigned int;
-		using size_type = unsigned int;
+		
 		size_type m_size;
 		size_type m_allocated_size;
 		size_type m_keys_offset;
@@ -324,7 +325,7 @@ class Packet {
 			if(need_len < 0) return 0;
 			
 			if(!alloc(need_len)) return 0;
-			int transfered = min(need_len, len);
+			int transfered = std::min(need_len, len);
 			
 			memcpy(m_data+m_size, data, transfered);
 			m_size += transfered;
@@ -381,6 +382,7 @@ class Packet {
 
 
 #ifdef USE_ENET
+#include <enet/enet.h>
 static void packetFreeCallback(ENetPacket* pkt) {
 	delete[] pkt->data;
 }
@@ -424,15 +426,16 @@ class PacketEnet : public Packet {
 #endif
 
 #ifdef USE_SDL_NET
+#include "SDL_net.h"
 class PacketTcp : public Packet {
 	private:
 	
 	public:
 		
-		bool send(TCPsocket* peer) {
-			if(!prepare_to_send()) return;
+		bool send(TCPsocket peer, int channel=0, int flags = 0) {
+			if(!prepare_to_send()) return false;
 
-			int sent = SDLNet_TCP_Send(peer,m_data,size());
+			int sent = SDLNet_TCP_Send(peer,data(),size());
 			if(sent < size()) {
 				// printf("SDLNet_TCP_Send: %s\n", SDLNet_GetError());
 				return false;
