@@ -15,6 +15,9 @@
 
 class Packet {
 	// num_keys, keys_offset, data..., keys
+	public:
+		const int meta_size = sizeof(size_type)*2;
+		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
 	private:
 		static constexpr unsigned int hash(const char *s, int off = 0) {
 			return s[off] ? (hash(s, off+(s[off+1] == '_' ? 2 : 1) )*33) ^ s[off] : 5381;
@@ -33,8 +36,8 @@ class Packet {
 		bool m_appended_keys;
 		size_type m_num_keys;
 		
-		const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
-		const int meta_size = sizeof(size_type)*2;
+		
+		
 		
 		// key, (offset, length)
 		std::map<key_type, std::pair<size_type, size_type>> m_offsets;
@@ -178,10 +181,10 @@ class Packet {
 			}
 		}
 		
-		bool read_metadata() {
-			if(m_size <= 8) return false;
+		bool read_metadata(const char* data=0) {
+			if(!data && m_size <= 8) return false;
 			// read keys
-			size_type* s = (size_type*)(m_data);
+			size_type* s = (size_type*)(data ? data : m_data);
 			m_num_keys = s[0];
 			m_keys_offset = s[1];
 			return true;
@@ -222,8 +225,9 @@ class Packet {
 			return m_data; 
 		}
 		
+		size_type left_to_fill() { return orig_packet_size() - m_size; }
+		bool empty() { return m_size == 0; }
 		size_t size() { return m_size+(!m_appended_keys ? keys_size() : 0); }
-		
 		size_t allocated_size() { return m_allocated_size; }
 		
 		// pair of data ptr, and length
@@ -298,22 +302,22 @@ class Packet {
 		
 		int append(const char* data, int len) {
 			if(m_readonly) return 0;
-			int orig_len = 0;
+			
 			int need_len = 0;
 			
 			// std::cout << "append cur size: " << m_size << " + " << len << "\n";
 			if(m_size < meta_size) {
 				if(len >= meta_size) {
-					orig_len = orig_packet_size(data);
+					read_metadata(data);
 					// std::cout << "reading orig len: " << orig_len << "\n";
 				} else {
 					return 0;
 				}
 			} else {
 				read_metadata();
-				orig_len = orig_packet_size();
 				// std::cout << "reading orig len2: " << orig_len << "\n";
 			}
+			int orig_len = orig_packet_size();
 			m_appended_keys = true;
 			
 			need_len = orig_len - m_size;
