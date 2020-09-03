@@ -20,26 +20,25 @@ class Packet {
 		using size_type = unsigned int;
 		static const int meta_size = sizeof(size_type)*2;
 		static const int bytes_per_key = sizeof(key_type)+sizeof(size_type)*2;
+		
+	protected:
+		bool m_sent;
+		
 	private:
 		static constexpr unsigned int hash(const char *s, int off = 0) {
 			return s[off] ? (hash(s, off+(s[off+1] == '_' ? 2 : 1) )*33) ^ s[off] : 5381;
 		}
 		
-		
 		size_type m_size;
 		size_type m_allocated_size;
 		size_type m_keys_offset;
 		char* m_data;
-		bool m_sent;
 		bool m_readonly;
 		bool m_packet_owns_data_ptr;
 		bool m_parsed_pkt;
 		bool m_appended_keys;
 		size_type m_num_keys;
-		
-		
-		
-		
+
 		// key, (offset, length)
 		std::map<key_type, std::pair<size_type, size_type>> m_offsets;
 		
@@ -105,6 +104,7 @@ class Packet {
 		
 		void appendKeysToPacket() {
 			if(m_readonly) return;
+			
 			if(m_appended_keys) {
 				// reset keys
 				m_size = m_keys_offset;
@@ -136,12 +136,13 @@ class Packet {
 	
 		
 		
-		Packet(char* data, int length) {
-			m_data = data;
+		Packet(const char* data, int length) {
+			m_data = (char*)data;
 			m_size = length;
 			m_sent = false;
 			m_readonly = true;
 			m_parsed_pkt = false;
+			m_appended_keys = true;
 			m_packet_owns_data_ptr = false;
 			parsePacket();
 		}
@@ -152,12 +153,13 @@ class Packet {
 			m_offsets = p.m_offsets;
 			m_sent = false;
 			m_readonly = false;
-			m_keys_offset = 0;
+			m_appended_keys = p.m_appended_keys;
+			m_keys_offset = p.m_keys_offset;
+			m_num_keys = p.m_num_keys;
 			m_size = p.m_size;
-			if(p.m_keys_offset != 0) {
-				m_size -= keys_size();
-			}
-			memcpy(m_data, p.m_data, m_size);
+			m_parsed_pkt = p.m_parsed_pkt;
+			// copy all data
+			memcpy(m_data, p.m_data, p.m_size);
 			m_packet_owns_data_ptr = true;
 		}
 		
@@ -169,7 +171,7 @@ class Packet {
 			m_data = new char[m_allocated_size];
 			m_sent = false;
 			m_readonly = false;
-			m_keys_offset = 0;
+			m_keys_offset = m_num_keys = 0;
 			m_packet_owns_data_ptr = true;
 			m_parsed_pkt = false;
 			m_appended_keys = false;
@@ -250,6 +252,21 @@ class Packet {
 			}
 		}
 		
+		template<typename T=int>
+		T get(const std::string& key) {
+			auto p = get_pair(key);
+			if(p.first && p.second == sizeof(T)) {
+				// value = *((T*)p.first);
+				return *((T*)p.first);
+			}
+			return (T)0;
+		}
+		
+		template<typename T=int*>
+		T* get_ptr(const std::string& key) {
+			return (T*)get_pair(key).first;
+		}
+		
 		int get_int(const std::string& key) {
 			auto p = get_pair(key);
 			if(p.first && p.second == sizeof(int)) {
@@ -294,13 +311,31 @@ class Packet {
 			}
 		}
 		
+		template<typename T=int>
+		void put(const std::string& key, const T& value) {
+			char* buffer = allocate(key, sizeof(T));
+			if(buffer) {
+				*((T*)(buffer)) = value;
+			}
+		}
+		
+		/*
 		void put(const std::string& key, int value) {
 			char* buffer = allocate(key, sizeof(int));
 			if(buffer) {
 				*((int*)(buffer)) = value;
 			}
 		}
+		*/
 		
+		void put(const std::string& key, const void* value, int len) {
+			char* buffer = allocate(key, len);
+			if(buffer) {
+				memcpy(buffer, value, len);
+			}
+		}
+		
+		// append 2 packets together (for TCP putting together packets)
 		int append(const char* data, int len) {
 			if(m_readonly) return 0;
 			
@@ -353,8 +388,8 @@ class Packet {
 		}
 		
 		bool prepare_to_send() {
-			if(m_readonly) return false;
 			if(!m_appended_keys) {
+				if(m_readonly) return false;
 				appendKeysToPacket();
 			}
 			return true;
@@ -391,19 +426,14 @@ class PacketEnet : public Packet {
 		ENetPacket* last_packet;
 	
 	public:
-		Packet(ENetPacket* pkt) {
-			m_data = (char*)pkt->data;
-			m_size = pkt->dataLength;
-			m_sent = false;
-			m_readonly = true;
-			parsePacket();
-		}
+		using Packet::Packet;
+		PacketEnet(ENetPacket* pkt) : Packet((char*)pkt->data, pkt->dataLength){}
 		
 		bool send(ENetPeer* peer, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
-			if(!prepare_to_send()) return;
+			if(!prepare_to_send()) return false;
 
 			if(!m_sent) {
-				last_packet = enet_packet_create(m_data, size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
+				last_packet = enet_packet_create(data(), size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
 				last_packet->freeCallback = packetFreeCallback;
 				m_sent = true;
 			}
@@ -412,10 +442,10 @@ class PacketEnet : public Packet {
 		}
 		
 		bool broadcast(ENetHost* host, int channel = 0, int flags = ENET_PACKET_FLAG_RELIABLE) {
-			if(!prepare_to_send()) return;
+			if(!prepare_to_send()) return false;
 			
 			if(!m_sent) {
-				last_packet = enet_packet_create(m_data, size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
+				last_packet = enet_packet_create(data(), size(), flags | ENET_PACKET_FLAG_NO_ALLOCATE);
 				last_packet->freeCallback = packetFreeCallback;
 				m_sent = true;
 			}
@@ -431,16 +461,14 @@ class PacketTcp : public Packet {
 	private:
 	
 	public:
-		
-		bool send(TCPsocket peer, int channel=0, int flags = 0) {
+		using Packet::Packet;
+		bool send(TCPsocket peer) {
 			if(!prepare_to_send()) return false;
 
 			int sent = SDLNet_TCP_Send(peer,data(),size());
 			if(sent < size()) {
-				// printf("SDLNet_TCP_Send: %s\n", SDLNet_GetError());
 				return false;
 			}
-			// m_sent = true;
 			return true;
 		}
 };
